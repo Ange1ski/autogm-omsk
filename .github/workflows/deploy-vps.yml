@@ -13,6 +13,9 @@ concurrency:
   group: autogm-vps-production
   cancel-in-progress: true
 
+env:
+  AUTOGM_DOMAIN: autogm.147-45-249-244.sslip.io
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -66,27 +69,95 @@ jobs:
           VPS_USER: ${{ secrets.AUTOGM_VPS_USER }}
         run: |
           ssh -i ~/.ssh/autogm_vps "${VPS_USER}@${VPS_HOST}" \
-            'bash -s' -- "$GITHUB_SHA" <<'REMOTE_SCRIPT'
+            'bash -s' -- "$GITHUB_SHA" "$AUTOGM_DOMAIN" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           release_id="$1"
+          domain="$2"
           release_dir="/var/www/autogm/releases/${release_id}"
           archive="/tmp/autogm-${release_id}.tgz"
 
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y nginx
+          apt-get install -y nginx certbot
 
           install -d -m 755 "$release_dir"
           tar -xzf "$archive" -C "$release_dir"
           rm -f "$archive"
           chown -R root:root /var/www/autogm
+          ln -sfn "$release_dir" /var/www/autogm/current
 
-          tee /etc/nginx/sites-available/autogm >/dev/null <<'NGINX_CONFIG'
+          ln -sfn /etc/nginx/sites-available/autogm /etc/nginx/sites-enabled/autogm
+
+          if [ -L /etc/nginx/sites-enabled/default ] && \
+             [ "$(readlink -f /etc/nginx/sites-enabled/default)" = /etc/nginx/sites-available/default ]; then
+            unlink /etc/nginx/sites-enabled/default
+          fi
+
+          if [ ! -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
+            sed "s/__AUTOGM_DOMAIN__/${domain}/g" >/etc/nginx/sites-available/autogm <<'HTTP_CONFIG'
           server {
               listen 80 default_server;
               listen [::]:80 default_server;
-              server_name _;
+              server_name __AUTOGM_DOMAIN__;
+
+              root /var/www/autogm/current;
+              index index.html;
+
+              location ^~ /.well-known/acme-challenge/ {
+                  try_files $uri =404;
+              }
+
+              location / {
+                  try_files $uri $uri/ $uri.html =404;
+              }
+          }
+          HTTP_CONFIG
+
+            nginx -t
+            systemctl enable --now nginx
+            systemctl reload nginx
+
+            certbot certonly --webroot \
+              --webroot-path /var/www/autogm/current \
+              --domain "$domain" \
+              --non-interactive \
+              --agree-tos \
+              --register-unsafely-without-email
+          fi
+
+          sed "s/__AUTOGM_DOMAIN__/${domain}/g" >/etc/nginx/sites-available/autogm <<'HTTPS_CONFIG'
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name __AUTOGM_DOMAIN__;
+
+              root /var/www/autogm/current;
+
+              location ^~ /.well-known/acme-challenge/ {
+                  try_files $uri =404;
+              }
+
+              location / {
+                  return 301 https://__AUTOGM_DOMAIN__$request_uri;
+              }
+          }
+
+          server {
+              listen 443 ssl default_server;
+              listen [::]:443 ssl default_server;
+              server_name __AUTOGM_DOMAIN__;
+
+              ssl_certificate /etc/letsencrypt/live/__AUTOGM_DOMAIN__/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/__AUTOGM_DOMAIN__/privkey.pem;
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_session_cache shared:AutoGM_SSL:10m;
+              ssl_session_timeout 1d;
+              ssl_session_tickets off;
+
+              add_header Strict-Transport-Security "max-age=31536000" always;
+              add_header X-Content-Type-Options "nosniff" always;
+              add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
               root /var/www/autogm/current;
               index index.html;
@@ -103,28 +174,27 @@ jobs:
 
               location = /healthz {
                   access_log off;
-                  add_header Content-Type text/plain;
+                  default_type text/plain;
                   return 200 "ok\n";
               }
           }
-          NGINX_CONFIG
+          HTTPS_CONFIG
 
-          ln -sfn "$release_dir" /var/www/autogm/current
-          ln -sfn /etc/nginx/sites-available/autogm /etc/nginx/sites-enabled/autogm
-
-          if [ -L /etc/nginx/sites-enabled/default ] && \
-             [ "$(readlink -f /etc/nginx/sites-enabled/default)" = /etc/nginx/sites-available/default ]; then
-            unlink /etc/nginx/sites-enabled/default
-          fi
+          install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+          tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx >/dev/null <<'RENEW_HOOK'
+          #!/bin/sh
+          systemctl reload nginx
+          RENEW_HOOK
+          chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
 
           nginx -t
           systemctl enable --now nginx
           systemctl reload nginx
+          systemctl enable --now certbot.timer
           curl --fail --silent --show-error --retry 8 --retry-all-errors \
-            --retry-delay 2 http://127.0.0.1/healthz
+            --retry-delay 2 --resolve "${domain}:443:127.0.0.1" \
+            "https://${domain}/healthz"
           REMOTE_SCRIPT
 
       - name: Verify public site
-        env:
-          VPS_HOST: ${{ secrets.AUTOGM_VPS_HOST }}
-        run: curl --fail --silent --show-error --retry 8 --retry-delay 3 "http://${VPS_HOST}/" >/dev/null
+        run: curl --fail --silent --show-error --retry 8 --retry-delay 3 "https://${AUTOGM_DOMAIN}/" >/dev/null
