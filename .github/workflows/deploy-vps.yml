@@ -1,0 +1,129 @@
+name: Deploy AutoGM to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autogm-vps-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static site for the VPS root
+        run: pnpm build
+
+      - name: Package release
+        run: tar -C out -czf "/tmp/autogm-${GITHUB_SHA}.tgz" .
+
+      - name: Configure SSH
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.AUTOGM_VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.AUTOGM_VPS_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > ~/.ssh/autogm_vps
+          chmod 600 ~/.ssh/autogm_vps
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        env:
+          VPS_HOST: ${{ secrets.AUTOGM_VPS_HOST }}
+          VPS_USER: ${{ secrets.AUTOGM_VPS_USER }}
+        run: |
+          scp -i ~/.ssh/autogm_vps \
+            "/tmp/autogm-${GITHUB_SHA}.tgz" \
+            "${VPS_USER}@${VPS_HOST}:/tmp/autogm-${GITHUB_SHA}.tgz"
+
+      - name: Activate release
+        env:
+          VPS_HOST: ${{ secrets.AUTOGM_VPS_HOST }}
+          VPS_USER: ${{ secrets.AUTOGM_VPS_USER }}
+        run: |
+          ssh -i ~/.ssh/autogm_vps "${VPS_USER}@${VPS_HOST}" \
+            'bash -s' -- "$GITHUB_SHA" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          release_id="$1"
+          release_dir="/var/www/autogm/releases/${release_id}"
+          archive="/tmp/autogm-${release_id}.tgz"
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y nginx
+
+          install -d -m 755 "$release_dir"
+          tar -xzf "$archive" -C "$release_dir"
+          rm -f "$archive"
+          chown -R root:root /var/www/autogm
+
+          tee /etc/nginx/sites-available/autogm >/dev/null <<'NGINX_CONFIG'
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+
+              root /var/www/autogm/current;
+              index index.html;
+
+              location /_next/static/ {
+                  try_files $uri =404;
+                  expires 1y;
+                  add_header Cache-Control "public, immutable";
+              }
+
+              location / {
+                  try_files $uri $uri/ $uri.html =404;
+              }
+
+              location = /healthz {
+                  access_log off;
+                  add_header Content-Type text/plain;
+                  return 200 "ok\n";
+              }
+          }
+          NGINX_CONFIG
+
+          ln -sfn "$release_dir" /var/www/autogm/current
+          ln -sfn /etc/nginx/sites-available/autogm /etc/nginx/sites-enabled/autogm
+
+          if [ -L /etc/nginx/sites-enabled/default ] && \
+             [ "$(readlink -f /etc/nginx/sites-enabled/default)" = /etc/nginx/sites-available/default ]; then
+            unlink /etc/nginx/sites-enabled/default
+          fi
+
+          nginx -t
+          systemctl enable --now nginx
+          systemctl reload nginx
+          curl --fail --silent --show-error http://127.0.0.1/healthz
+          REMOTE_SCRIPT
+
+      - name: Verify public site
+        env:
+          VPS_HOST: ${{ secrets.AUTOGM_VPS_HOST }}
+        run: curl --fail --silent --show-error --retry 8 --retry-delay 3 "http://${VPS_HOST}/" >/dev/null
