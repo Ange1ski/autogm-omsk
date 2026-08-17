@@ -120,7 +120,8 @@ jobs:
           nginx -t
           systemctl enable --now nginx
           systemctl reload nginx
-          curl --fail --silent --show-error http://127.0.0.1/healthz
+          curl --fail --silent --show-error --retry 8 --retry-all-errors \
+            --retry-delay 2 http://127.0.0.1/healthz
           REMOTE_SCRIPT
 
       - name: Verify public site
